@@ -1,0 +1,17 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /categories/{cid} {
+      allow get: if request.auth != null &&
+        exists(/databases/$(database)/documents/categories/$(cid)/members/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/categories/$(cid)/members/$(request.auth.uid)).data.status == 'ACTIVE' &&
+        (resource.data.deleted_at == null || resource.data.owner_uid == request.auth.uid);
+    }
+    match /accountSignals/{uid} {
+      allow get: if request.auth != null && request.auth.uid == uid;
+    }
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
