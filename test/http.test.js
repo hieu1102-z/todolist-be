@@ -65,6 +65,7 @@ test('HTTP verifies Firebase ID tokens and rejects invalid sessions', { skip: !e
   try {
     const health = await fetch(origin + '/healthz');
     assert.deepEqual(await health.json(), { ok: true });
+    assert.equal(health.headers.get('X-Workspace-Features'), 'default-category-v1');
     const user = await signUp();
     const read = { kind: 'LIST', expected_uid: user.localId };
     assert.equal((await request(origin, read)).status, 401);

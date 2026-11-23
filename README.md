@@ -51,7 +51,8 @@ Lệnh deploy đưa Rules và indexes từ repo BE lên project đã chọn. Nod
 
 ## Hợp đồng HTTP
 
-- GET /healthz trả trạng thái tiến trình.
+- GET /healthz trả trạng thái tiến trình. Header `X-Workspace-Features: default-category-v1` xác nhận phiên bản hỗ trợ danh mục mặc định.
+- Lệnh `ENSURE_DEFAULT_CATEGORY` tạo danh mục ẩn riêng của UID xác thực. `LIST` chỉ trả danh mục đó khi client gửi `include_default: true`. Các danh mục thường tên `to do` vẫn hoạt động như trước.
 - POST /v1/workspace nhận JSON theo cấu trúc lệnh workspace, với Firebase ID token trong Authorization: Bearer <id-token>.
 - HTTP 200 trả result cho thao tác xác nhận. HTTP 202 trả result.pending=true khi Firestore đã ghi công việc dọn và chờ hoàn thành. Gửi lại đúng operation_id và cùng nội dung để lấy kết quả.
 - Phản hồi lỗi có business_code. API kiểm tra UID xác thực, quyền thành viên và quyền OWNER cho xóa vĩnh viễn.

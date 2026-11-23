@@ -7,7 +7,7 @@ const { initializeApp, deleteApp } = require('firebase-admin/app');
 const { getFirestore } = require('firebase-admin/firestore');
 const { doc, getDoc, setDoc } = require('firebase/firestore');
 const { initializeTestEnvironment, assertFails, assertSucceeds } = require('@firebase/rules-unit-testing');
-const { workspace, requireRole, revision } = require('../src/workspace');
+const { workspace, requireRole, revision, defaultCategoryId } = require('../src/workspace');
 
 test('authorization and optimistic revision reject stale or unauthorized changes', () => {
   assert.throws(() => requireRole({ status: 'ACTIVE', role: 'EDITOR' }, ['OWNER']), { code: 'permission-denied' });
@@ -51,6 +51,56 @@ if (process.env.FIRESTORE_EMULATOR_HOST) {
   after(async () => {
     if (environment) await environment.cleanup();
     if (app) await deleteApp(app);
+  });
+
+
+  test('private default categories synchronize without becoming shareable', async () => {
+    const uid = 'default-test';
+    const other = 'other-default-test';
+    const defaultId = defaultCategoryId(uid);
+    const otherId = defaultCategoryId(other);
+    const oldTodo = randomUUID();
+    const taskId = randomUUID();
+    const target = { category_id: defaultId };
+    const onlyTask = { ...target, entity_type: 'TASK', task_id: taskId, entity_id: taskId };
+    const op = { ...target, operation_id: randomUUID(), client_occurred_at: Date.now() };
+
+    await call(uid, 'CREATE', { category_id: oldTodo, entity_type: 'CATEGORY', payload: { name: 'to do' } });
+    await assert.rejects(call(other, 'CREATE', { ...target, entity_type: 'CATEGORY', payload: { name: 'New' } }),
+      business('RESERVED_CATEGORY_ID'));
+    await assert.rejects(call(other, 'ENSURE_DEFAULT_CATEGORY', target), business('INVALID_ARGUMENT'));
+    const [first, second] = await Promise.all([
+      call(uid, 'ENSURE_DEFAULT_CATEGORY', op), call(uid, 'ENSURE_DEFAULT_CATEGORY', target)
+    ]);
+    assert.deepEqual(first, second);
+    assert.deepEqual(await call(uid, 'ENSURE_DEFAULT_CATEGORY', op), first);
+    await call(other, 'ENSURE_DEFAULT_CATEGORY', { category_id: otherId });
+
+    assert.deepEqual((await call(uid, 'LIST')).items.map(item => item.id), [oldTodo]);
+    assert.deepEqual(new Set((await call(uid, 'LIST', { include_default: true })).items.map(item => item.id)),
+      new Set([defaultId, oldTodo]));
+    assert.deepEqual((await call(other, 'LIST', { include_default: true })).items.map(item => item.id), [otherId]);
+    await assert.rejects(call(other, 'SNAPSHOT', { ...target, section: 'TASK' }), business('PERMISSION_DENIED'));
+    await assertFails(getDoc(doc(environment.authenticatedContext(other).firestore(), 'categories', defaultId)));
+    for (const kind of ['UPDATE', 'TRASH', 'RESTORE', 'PURGE']) {
+      await assert.rejects(call(uid, kind, { ...target, entity_type: 'CATEGORY', base_revision: 1 }),
+        business('DEFAULT_CATEGORY_PROTECTED'));
+    }
+    await assert.rejects(call(uid, 'INVITE', { ...target, invitation_id: randomUUID(), role: 'EDITOR',
+      email: other + '@example.test' }), business('DEFAULT_CATEGORY_PROTECTED'));
+
+    const created = await call(uid, 'CREATE', { ...onlyTask, base_revision: 0, payload: { title: 'Draft' } });
+    await call(uid, 'UPDATE', { ...onlyTask, base_revision: created.revision, payload: { title: 'Updated' } });
+    assert.equal((await call(uid, 'SNAPSHOT', { ...target, section: 'TASK' })).rows[0].title, 'Updated');
+    const trashed = await call(uid, 'TRASH', { ...onlyTask, base_revision: created.revision + 1 });
+    await call(uid, 'RESTORE', { ...onlyTask, base_revision: trashed.revision });
+
+    const occupiedUid = 'occupied-default-test';
+    const occupiedId = defaultCategoryId(occupiedUid);
+    const occupied = db.doc('categories/' + occupiedId);
+    await occupied.set({ id: occupiedId, owner_uid: other, name: 'Existing', name_key: 'existing' });
+    await assert.rejects(call(occupiedUid, 'ENSURE_DEFAULT_CATEGORY', { category_id: occupiedId }), business('OBJECT_ID_REUSED'));
+    assert.equal((await occupied.get()).data().name, 'Existing');
   });
 
   test('sharing, rules, revisions, trash and resumable cleanup on Firestore', async () => {

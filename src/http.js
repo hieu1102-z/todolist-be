@@ -57,6 +57,7 @@ function workspaceHttpServer({ auth, service, onPending = () => {}, logger = con
   return createServer({ headersTimeout: 10_000, requestTimeout: 30_000 }, async (request, response) => {
     const path = request.url?.split('?', 1)[0];
     if (path === '/healthz' && request.method === 'GET') {
+      response.setHeader('X-Workspace-Features', 'default-category-v1');
       send(response, 200, { ok: true });
       return;
     }

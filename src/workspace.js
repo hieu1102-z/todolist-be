@@ -31,6 +31,18 @@ function hash(value) {
   return createHash('sha256').update(JSON.stringify(value)).digest('hex');
 }
 
+function defaultCategoryId(uid) {
+  const bytes = createHash('sha256').update('todolist/default-category/v1:' + uid).digest();
+  bytes[6] = (bytes[6] & 0x0f) | 0x80;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const id = bytes.subarray(0, 16).toString('hex');
+  return [id.slice(0, 8), id.slice(8, 12), id.slice(12, 16), id.slice(16, 20), id.slice(20)].join('-');
+}
+
+function isDefaultCategory(category) {
+  return category?.name_key === '' && category.id === defaultCategoryId(category.owner_uid);
+}
+
 function canonical(value) {
   if (Array.isArray(value)) return value.map(canonical);
   if (value && typeof value === 'object') {
@@ -175,7 +187,25 @@ function workspace(db) {
     const [category, member] = await Promise.all([read(tx, cat), read(tx, memberRef)]);
     const seq = (category?.server_seq ?? 0) + 1;
     const stamp = { server_seq: seq, server_updated_at: now };
+    if (data.kind === 'ENSURE_DEFAULT_CATEGORY') {
+      check(cid === defaultCategoryId(uid));
+      if (category) {
+        if (!isDefaultCategory(category) || category.owner_uid !== uid || category.deleted_at != null ||
+            member?.role !== 'OWNER' || member.status !== 'ACTIVE') reject('already-exists', 'OBJECT_ID_REUSED');
+        return { revision: category.revision, seq: category.server_seq };
+      }
+      const creation = db.collection('creationKeys').doc(hash(['CATEGORY', cid]));
+      if (member || await read(tx, creation)) reject('already-exists', 'OBJECT_ID_REUSED');
+      tx.create(creation, { id: cid });
+      tx.create(cat, { id: cid, owner_uid: uid, name: 'Mặc định', name_key: '', color: null,
+        deleted_at: null, created_at: now, client_updated_at: millis(data.client_occurred_at), revision: 1, ...stamp });
+      tx.create(memberRef, { category_id: cid, user_uid: uid, role: 'OWNER', status: 'ACTIVE',
+        joined_at: now, revision: 1, ...stamp });
+      sendSignal(tx, uid, now, op);
+      return { revision: 1, seq };
+    }
     if (data.kind === 'CREATE' && data.entity_type === 'CATEGORY') {
+      check(cid[14] !== '8', 'RESERVED_CATEGORY_ID');
       const fields = patch('CATEGORY', data.payload, true);
       const key = ownerName(uid, fields.name_key);
       const creation = db.collection('creationKeys').doc(hash(['CATEGORY', cid]));
@@ -193,6 +223,12 @@ function workspace(db) {
     }
 
     must(category);
+    if (isDefaultCategory(category)) {
+      if (uid !== category.owner_uid) reject('permission-denied', 'PERMISSION_DENIED');
+      if (data.entity_type === 'CATEGORY' || ['INVITE', 'ACCEPT', 'DECLINE', 'CANCEL', 'LEAVE', 'REMOVE_MEMBER', 'ROLE'].includes(data.kind)) {
+        reject('failed-precondition', 'DEFAULT_CATEGORY_PROTECTED');
+      }
+    }
     if (category.cleanup_job) {
       if (category.cleanup_job === hash([uid, op])) {
         const job = must(await read(tx, jobs.doc(category.cleanup_job)));
@@ -409,6 +445,7 @@ function workspace(db) {
       items: parents.flatMap((doc, i) => {
         const category = doc.data();
         const role = active[i].data().role;
+        if (isDefaultCategory(category) && (data.include_default !== true || category.owner_uid !== uid)) return [];
         return category && (category.deleted_at == null || role === 'OWNER') ? [{ id: doc.id, role }] : [];
       }),
       next: rows.size === PAGE ? rows.docs.at(-1).ref.path : null
@@ -421,7 +458,8 @@ function workspace(db) {
     return db.runTransaction(async tx => {
       const [category, member] = await Promise.all([read(tx, cat), read(tx, cat.collection('members').doc(uid))]);
       requireRole(member);
-      if (!category || category.deleted_at != null && member.role !== 'OWNER') {
+      if (!category || isDefaultCategory(category) && category.owner_uid !== uid ||
+          category.deleted_at != null && member.role !== 'OWNER') {
         reject('permission-denied', 'PERMISSION_DENIED');
       }
       if (category.cleanup_job && (await read(tx, jobs.doc(category.cleanup_job)))?.kind !== 'MEMBER') {
@@ -470,7 +508,11 @@ function workspace(db) {
     const cid = sent ? uuid(data.category_id) : null;
     if (!sent && auth.token.email_verified !== true) reject('failed-precondition', 'EMAIL_NOT_VERIFIED');
     return db.runTransaction(async tx => {
-      if (sent) requireRole(await read(tx, categories.doc(cid).collection('members').doc(uid)), ['OWNER']);
+      if (sent) {
+        const cat = categories.doc(cid);
+        requireRole(await read(tx, cat.collection('members').doc(uid)), ['OWNER']);
+        if (isDefaultCategory(await read(tx, cat))) reject('failed-precondition', 'DEFAULT_CATEGORY_PROTECTED');
+      }
       const field = sent ? 'category_id' : 'invitee_email_key';
       const value = sent ? cid : emailKey(auth.token.email);
       let query = invitations.where(field, '==', value).orderBy(FieldPath.documentId()).limit(PAGE);
@@ -586,4 +628,4 @@ function workspace(db) {
   };
 }
 
-module.exports = { workspace, canonical, requireRole, revision };
+module.exports = { workspace, canonical, requireRole, revision, defaultCategoryId };
