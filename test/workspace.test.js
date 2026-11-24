@@ -103,6 +103,33 @@ if (process.env.FIRESTORE_EMULATOR_HOST) {
     assert.equal((await occupied.get()).data().name, 'Existing');
   });
 
+  test('category appearance is available in snapshots and survives legacy renames', async () => {
+    const uid = 'category-style-test';
+    const categoryId = randomUUID();
+    const target = { category_id: categoryId, entity_type: 'CATEGORY' };
+    const snapshot = async () => (await call(uid, 'SNAPSHOT', { ...target, section: 'MEMBER' })).category;
+
+    await assert.rejects(call(uid, 'CREATE', { ...target, payload: { name: 'Styled', icon: 'invalid' } }),
+      business('INVALID_ARGUMENT'));
+    await assert.rejects(call(uid, 'CREATE', { ...target, payload: { name: 'Styled', color: ['#4F6BED'] } }),
+      business('INVALID_ARGUMENT'));
+    const created = await call(uid, 'CREATE', { ...target, payload: { name: 'Styled', icon: 'book', color: '#4F6BED' } });
+    assert.equal((await snapshot()).icon, 'book');
+    assert.equal((await snapshot()).color, '#4F6BED');
+
+    const renamed = await call(uid, 'UPDATE', { ...target, base_revision: created.revision, payload: { name: 'Renamed' } });
+    assert.equal((await snapshot()).icon, 'book');
+    assert.equal((await snapshot()).color, '#4F6BED');
+    await call(uid, 'UPDATE', { ...target, base_revision: renamed.revision, payload: { icon: null } });
+    assert.equal((await snapshot()).icon, null);
+
+    const legacy = randomUUID();
+    await call(uid, 'CREATE', { ...target, category_id: legacy, payload: { name: 'Legacy' } });
+    const category = (await call(uid, 'SNAPSHOT', { category_id: legacy, section: 'MEMBER' })).category;
+    assert.equal(category.icon, undefined);
+    assert.equal(category.color, null);
+  });
+
   test('sharing, rules, revisions, trash and resumable cleanup on Firestore', async () => {
     await call(owner, 'PROFILE');
     await call(editor, 'PROFILE');

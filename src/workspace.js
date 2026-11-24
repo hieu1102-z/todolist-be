@@ -3,6 +3,7 @@ const { FieldPath } = require('firebase-admin/firestore');
 const { WorkspaceError } = require('./errors');
 
 const ROLES = ['OWNER', 'EDITOR', 'VIEWER'];
+const CATEGORY_ICONS = ['plus', 'folder', 'check', 'star', 'book', 'work', 'shopping', 'heart'];
 const TYPES = ['TASK', 'SUBTASK', 'PARTICIPANT', 'REMINDER'];
 const COLLECTIONS = { TASK: 'tasks', SUBTASK: 'subtasks', PARTICIPANT: 'participants', REMINDER: 'reminders' };
 const PAGE = 50;
@@ -111,7 +112,7 @@ function workspace(db) {
 
   function patch(type, payload, create) {
     const allowed = {
-      CATEGORY: ['name', 'color'],
+      CATEGORY: ['name', 'color', 'icon'],
       TASK: ['title', 'description', 'due_at', 'priority', 'repeat_type', 'timezone', 'repeat_anchor_day',
         ...(create ? ['is_done', 'completed_at', 'created_at'] : [])],
       SUBTASK: ['title', 'is_done', 'sort_order'],
@@ -126,7 +127,9 @@ function workspace(db) {
       fields.name_key = fields.name.toLowerCase();
     }
     if ('title' in fields) fields.title = name(fields.title, 200);
-    if ('color' in fields) check(fields.color === null || /^#[\da-f]{6}$/i.test(fields.color));
+    if ('color' in fields) check(fields.color === null ||
+      (typeof fields.color === 'string' && /^#[\da-f]{6}$/i.test(fields.color)));
+    if ('icon' in fields) check(fields.icon === null || CATEGORY_ICONS.includes(fields.icon));
     if ('description' in fields) check(fields.description === null ||
       (typeof fields.description === 'string' && fields.description.length <= 10000));
     if ('due_at' in fields && fields.due_at !== null) millis(fields.due_at);
