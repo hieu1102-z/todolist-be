@@ -1,6 +1,7 @@
 const { createHash } = require('node:crypto');
 const { FieldPath } = require('firebase-admin/firestore');
 const { WorkspaceError } = require('./errors');
+const { elapsedMs } = require('./sync-trace');
 
 const ROLES = ['OWNER', 'EDITOR', 'VIEWER'];
 const CATEGORY_ICONS = ['plus', 'folder', 'check', 'star', 'book', 'work', 'shopping', 'heart'];
@@ -100,6 +101,11 @@ function workspace(db) {
   const inviteKey = (cid, email) => db.collection('pendingInvitationKeys').doc(hash([cid, email]));
   const sendSignal = (tx, uid, now, op) => tx.set(accessSignals.doc(uid), { changed_at: now, operation_id: op });
   const read = async (tx, ref) => (await tx.get(ref)).data();
+  async function readAll(tx, refs) {
+    const unique = new Map(refs.map(ref => [ref.path, ref]));
+    if (unique.size === 0) return new Map();
+    return new Map((await tx.getAll(...unique.values())).map(doc => [doc.ref.path, doc.data()]));
+  }
 
   function route(cat, data, actor) {
     if (data.entity_type === 'CATEGORY') return [cat, null];
@@ -441,18 +447,25 @@ function workspace(db) {
     let query = db.collectionGroup('members').where('user_uid', '==', uid)
       .orderBy(FieldPath.documentId()).limit(PAGE);
     if (data.cursor) query = query.startAfter(db.doc(data.cursor));
-    const rows = await query.get();
-    const active = rows.docs.filter(doc => doc.data().status === 'ACTIVE');
-    const parents = active.length ? await db.getAll(...active.map(doc => doc.ref.parent.parent)) : [];
-    return {
-      items: parents.flatMap((doc, i) => {
-        const category = doc.data();
-        const role = active[i].data().role;
-        if (isDefaultCategory(category) && (data.include_default !== true || category.owner_uid !== uid)) return [];
-        return category && (category.deleted_at == null || role === 'OWNER') ? [{ id: doc.id, role }] : [];
-      }),
-      next: rows.size === PAGE ? rows.docs.at(-1).ref.path : null
-    };
+    return db.runTransaction(async tx => {
+      const rows = await tx.get(query);
+      const active = rows.docs.filter(doc => doc.data().status === 'ACTIVE');
+      const parents = await readAll(tx, active.map(doc => doc.ref.parent.parent));
+      const items = [];
+      for (const member of active) {
+        const ref = member.ref.parent.parent;
+        const category = parents.get(ref.path);
+        const { role } = member.data();
+        if (!category || (category.deleted_at != null && role !== 'OWNER')) continue;
+        if (isDefaultCategory(category) && (data.include_default !== true || category.owner_uid !== uid)) continue;
+        const item = { id: ref.id, role };
+        if (data.include_sync_metadata === true && Number.isSafeInteger(category.server_seq)) {
+          item.server_seq = category.server_seq;
+        }
+        items.push(item);
+      }
+      return { items, next: rows.size === PAGE ? rows.docs.at(-1).ref.path : null };
+    }, { readOnly: true });
   }
 
   async function snapshot(auth, data) {
@@ -478,28 +491,35 @@ function workspace(db) {
       query = query.orderBy(FieldPath.documentId()).limit(PAGE);
       if (data.cursor) query = query.startAfter(kind === 'MEMBER' ? data.cursor : db.doc(data.cursor));
       const result = await tx.get(query);
+      const candidates = result.docs.map(doc => ({ ref: doc.ref, row: doc.data() }))
+        .filter(({ row }) => (kind !== 'MEMBER' || row.status === 'ACTIVE') &&
+          (member.role !== 'VIEWER' || row.deleted_at == null));
+      const needsParent = ['SUBTASK', 'PARTICIPANT', 'REMINDER'].includes(kind);
+      const members = cat.collection('members');
+      const relatedRefs = needsParent ? candidates.map(({ ref }) => ref.parent.parent) : [];
+      if (kind === 'PARTICIPANT') relatedRefs.push(...candidates.map(({ row }) => members.doc(row.user_uid)));
+      const related = await readAll(tx, relatedRefs);
       const visible = [];
       const profiles = new Set([category.owner_uid]);
-      for (const doc of result.docs) {
-        const row = doc.data();
-        if (kind === 'MEMBER' && row.status !== 'ACTIVE') continue;
-        if (member.role === 'VIEWER' && row.deleted_at != null) continue;
-        if (['SUBTASK', 'PARTICIPANT', 'REMINDER'].includes(kind)) {
-          const parent = await read(tx, doc.ref.parent.parent);
+      for (const { ref, row } of candidates) {
+        if (needsParent) {
+          const parent = related.get(ref.parent.parent.path);
           if (!parent || (member.role === 'VIEWER' && parent.deleted_at != null)) continue;
         }
         if (kind === 'PARTICIPANT') {
-          const participant = await read(tx, cat.collection('members').doc(row.user_uid));
+          const participant = related.get(members.doc(row.user_uid).path);
           if (participant?.status !== 'ACTIVE' || participant.role === 'VIEWER') continue;
         }
         visible.push(row);
         if (row.created_by_uid) profiles.add(row.created_by_uid);
         if (row.user_uid) profiles.add(row.user_uid);
       }
-      const display = await Promise.all([...profiles].map(async profileUid => {
-        const profile = await read(tx, users.doc(profileUid));
-        return { uid: profileUid, full_name: profile?.full_name || 'Thành viên', avatar_url: profile?.avatar_url ?? null };
-      }));
+      const profileRefs = [...profiles].map(profileUid => users.doc(profileUid));
+      const profilesByPath = await readAll(tx, profileRefs);
+      const display = profileRefs.map(ref => {
+        const profile = profilesByPath.get(ref.path);
+        return { uid: ref.id, full_name: profile?.full_name || 'Thành viên', avatar_url: profile?.avatar_url ?? null };
+      });
       const { cleanup_job, ...publicCategory } = category;
       return { seq, category: publicCategory, role: member.role, rows: visible, profiles: display,
         next: result.size === PAGE ? (kind === 'MEMBER' ? result.docs.at(-1).id : result.docs.at(-1).ref.path) : null };
@@ -539,7 +559,7 @@ function workspace(db) {
     // Each page and the final receipt are guarded by the same durable lock.
       return db.runTransaction(async tx => {
         const job = await read(tx, jobRef);
-        if (job?.status !== 'PENDING') return false;
+        if (job?.status !== 'PENDING') return null;
         const cat = categories.doc(job.category_id);
         const category = await read(tx, cat);
         if (category?.cleanup_job !== jobId) throw new Error('Cleanup lock missing');
@@ -575,7 +595,7 @@ function workspace(db) {
               sendSignal(tx, ref.id, Date.now(), job.operation_id);
             }
           }
-          return true;
+          return { more: true };
         }
         const now = Date.now();
         const result = { ok: true, seq: category.server_seq + 1 };
@@ -584,48 +604,53 @@ function workspace(db) {
         tx.create(db.collection('operationReceipts').doc(hash([job.actor, job.operation_id])),
           { digest: job.digest, result, accepted_at: now });
         tx.delete(jobRef);
-        return false;
+        return { more: false, seq: result.seq };
       });
   }
 
   async function cleanup(jobId) {
-    while (await cleanupBatch(jobId)) {
+    while ((await cleanupBatch(jobId))?.more) {
       // Tests and maintenance can wait for full completion; the worker uses one batch at a time.
     }
   }
 
   return {
     cleanup, cleanupBatch,
-    async call(auth, data) {
+    async call(auth, data, onFirestoreElapsed) {
       if (!auth) reject('unauthenticated', 'UNAUTHENTICATED');
       userId(auth.uid);
       check(data && typeof data === 'object' && !Array.isArray(data) && JSON.stringify(data).length <= 65536);
       if (data.expected_uid !== auth.uid) reject('permission-denied', 'ACCOUNT_CHANGED');
-      switch (data.kind) {
-        case 'PROFILE': {
-          const fields = {
-            uid: auth.uid, email: auth.token.email ?? '', full_name: String(auth.token.name ?? '').slice(0, 100),
-            avatar_url: auth.token.picture ?? null
-          };
-          const ref = users.doc(auth.uid);
-          await db.runTransaction(async tx => {
-            const previous = await read(tx, ref);
-            if (!previous || Object.keys(fields).some(key => previous[key] !== fields[key])) tx.set(ref, fields);
-          });
-          return { ok: true };
+      if (data.kind === 'INVITE') {
+        // Resolve the recipient on the server. Do not accept a client-supplied target UID.
+        let target;
+        try { target = await auth.lookupEmail(emailKey(data.email)); }
+        catch (error) { if (error.code !== 'auth/user-not-found') throw error; }
+        data = { ...data, target_uid: target?.uid ?? null };
+      }
+      const started = performance.now();
+      try {
+        switch (data.kind) {
+          case 'PROFILE': {
+            const fields = {
+              uid: auth.uid, email: auth.token.email ?? '', full_name: String(auth.token.name ?? '').slice(0, 100),
+              avatar_url: auth.token.picture ?? null
+            };
+            const ref = users.doc(auth.uid);
+            await db.runTransaction(async tx => {
+              const previous = await read(tx, ref);
+              if (!previous || Object.keys(fields).some(key => previous[key] !== fields[key])) tx.set(ref, fields);
+            });
+            return { ok: true };
+          }
+          case 'LIST': return await listCategories(auth, data);
+          case 'SNAPSHOT': return await snapshot(auth, data);
+          case 'INBOX': return await inbox(auth, data, false);
+          case 'SENT': return await inbox(auth, data, true);
+          default: return await mutate(auth, data);
         }
-        case 'LIST': return listCategories(auth, data);
-        case 'SNAPSHOT': return snapshot(auth, data);
-        case 'INBOX': return inbox(auth, data, false);
-        case 'SENT': return inbox(auth, data, true);
-        case 'INVITE': {
-          // Resolve the recipient on the server. Do not accept a client-supplied target UID.
-          let target;
-          try { target = await auth.lookupEmail(emailKey(data.email)); }
-          catch (error) { if (error.code !== 'auth/user-not-found') throw error; }
-          return mutate(auth, { ...data, target_uid: target?.uid ?? null });
-        }
-        default: return mutate(auth, data);
+      } finally {
+        onFirestoreElapsed?.(elapsedMs(started));
       }
     }
   };

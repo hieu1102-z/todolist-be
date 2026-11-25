@@ -76,10 +76,12 @@ if (process.env.FIRESTORE_EMULATOR_HOST) {
     assert.deepEqual(await call(uid, 'ENSURE_DEFAULT_CATEGORY', op), first);
     await call(other, 'ENSURE_DEFAULT_CATEGORY', { category_id: otherId });
 
-    assert.deepEqual((await call(uid, 'LIST')).items.map(item => item.id), [oldTodo]);
+    assert.deepEqual((await call(uid, 'LIST')).items, [{ id: oldTodo, role: 'OWNER' }]);
     assert.deepEqual(new Set((await call(uid, 'LIST', { include_default: true })).items.map(item => item.id)),
       new Set([defaultId, oldTodo]));
     assert.deepEqual((await call(other, 'LIST', { include_default: true })).items.map(item => item.id), [otherId]);
+    assert.deepEqual((await call(other, 'LIST', { include_default: true, include_sync_metadata: true })).items,
+      [{ id: otherId, role: 'OWNER', server_seq: 1 }]);
     await assert.rejects(call(other, 'SNAPSHOT', { ...target, section: 'TASK' }), business('PERMISSION_DENIED'));
     await assertFails(getDoc(doc(environment.authenticatedContext(other).firestore(), 'categories', defaultId)));
     for (const kind of ['UPDATE', 'TRASH', 'RESTORE', 'PURGE']) {
@@ -130,6 +132,44 @@ if (process.env.FIRESTORE_EMULATOR_HOST) {
     assert.equal(category.color, null);
   });
 
+  test('opt-in LIST and consistent snapshots paginate beyond 50 items', async () => {
+    const uid = 'pagination-test';
+    const ids = Array.from({ length: 53 }, () => randomUUID()).sort();
+    const categoryId = ids[0];
+    const batch = db.batch();
+    for (const id of ids) {
+      const category = db.doc('categories/' + id);
+      batch.set(category, { id, owner_uid: uid, name: 'Page ' + id, server_seq: 7 });
+      batch.set(category.collection('members').doc(uid), { user_uid: uid, role: 'OWNER', status: 'ACTIVE' });
+    }
+    const taskIds = Array.from({ length: 53 }, () => randomUUID()).sort();
+    for (const id of taskIds) {
+      batch.set(db.doc('categories/' + categoryId + '/tasks/' + id), { id, category_id: categoryId, created_by_uid: uid });
+    }
+    await batch.commit();
+
+    const list = { include_sync_metadata: true };
+    const first = await call(uid, 'LIST', list);
+    assert.equal(first.items.length, 50);
+    const last = await call(uid, 'LIST', { ...list, cursor: first.next });
+    assert.deepEqual([...first.items, ...last.items], ids.map(id => ({ id, role: 'OWNER', server_seq: 7 })));
+    assert.equal(last.next, null);
+
+    const scope = { category_id: categoryId, section: 'TASK' };
+    const snapshot = await call(uid, 'SNAPSHOT', scope);
+    assert.equal(snapshot.rows.length, 50);
+    assert.equal(snapshot.seq, 7);
+    const next = await call(uid, 'SNAPSHOT', { ...scope, seq: snapshot.seq, cursor: snapshot.next });
+    assert.deepEqual([...snapshot.rows, ...next.rows].map(row => row.id), taskIds);
+    assert.equal(next.next, null);
+    const created = randomUUID();
+    await call(uid, 'CREATE', {
+      ...scope, entity_type: 'TASK', entity_id: created, task_id: created, base_revision: 0, payload: { title: 'Changed page' }
+    });
+    await assert.rejects(call(uid, 'SNAPSHOT', { ...scope, seq: snapshot.seq, cursor: snapshot.next }),
+      business('SNAPSHOT_CHANGED'));
+  });
+
   test('sharing, rules, revisions, trash and resumable cleanup on Firestore', async () => {
     await call(owner, 'PROFILE');
     await call(editor, 'PROFILE');
@@ -173,12 +213,16 @@ if (process.env.FIRESTORE_EMULATOR_HOST) {
 
     const child = { entity_type: 'SUBTASK', task_id: tid, entity_id: sid, base_revision: 0, payload: { title: 'Việc con' } };
     await call(editor, 'CREATE', child);
+    assert.equal((await call(viewer, 'SNAPSHOT', { section: 'SUBTASK' })).rows.length, 1);
     await assert.rejects(call(editor, 'SNAPSHOT', { section: 'SUBTASK', seq: firstPage.seq }), business('SNAPSHOT_CHANGED'));
+    const activeChild = randomUUID();
+    await call(editor, 'CREATE', { ...child, entity_id: activeChild });
     const subtrash = await call(editor, 'TRASH', { ...child, base_revision: 1 });
     const trashed = await call(editor, 'TRASH', task({ base_revision: 2 }));
     await assert.rejects(call(editor, 'PURGE', task({ base_revision: trashed.revision })), business('PERMISSION_DENIED'));
     assert.ok((await taskRef().get()).data().deleted_at);
     assert.equal((await call(viewer, 'SNAPSHOT', { section: 'TASK' })).rows.length, 0);
+    assert.equal((await call(viewer, 'SNAPSHOT', { section: 'SUBTASK' })).rows.length, 0);
     const restored = await call(editor, 'RESTORE', task({ base_revision: trashed.revision }));
     assert.ok((await taskRef().collection('subtasks').doc(sid).get()).data().deleted_at);
     await assert.rejects(call(editor, 'PURGE', { ...child, base_revision: subtrash.revision, payload: null }),
@@ -191,6 +235,8 @@ if (process.env.FIRESTORE_EMULATOR_HOST) {
     const leave = await call(editor, 'LEAVE');
     assert.equal(leave.pending, true);
     await assert.rejects(call(editor, 'SNAPSHOT', { section: 'TASK' }), business('PERMISSION_DENIED'));
+    assert.deepEqual((await call(editor, 'LIST', { include_sync_metadata: true })).items, []);
+    assert.deepEqual((await call(owner, 'SNAPSHOT', { section: 'PARTICIPANT' })).rows.map(row => row.user_uid), [owner]);
     for (const job of (await db.collection('cleanupJobs').get()).docs) await service.cleanup(job.id);
     assert.equal((await taskRef().collection('participants').get()).size, 1);
     await assertFails(getDoc(doc(editorDb, 'categories', cid)));

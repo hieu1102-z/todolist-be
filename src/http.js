@@ -1,7 +1,9 @@
 const { createServer } = require('node:http');
 const { WorkspaceError, statusByCode } = require('./errors');
+const { uuidForTrace, categoryHash, elapsedMs } = require('./sync-trace');
 
 const MAX_BODY = 65_536;
+const SYNC_KINDS = new Set(['LIST', 'PROFILE', 'SNAPSHOT', 'TRASH', 'RESTORE', 'PURGE']);
 const INVALID_AUTH = new Set([
   'auth/id-token-revoked', 'auth/invalid-id-token', 'auth/argument-error',
   'auth/invalid-argument', 'auth/user-disabled', 'auth/user-not-found'
@@ -57,7 +59,7 @@ function workspaceHttpServer({ auth, service, onPending = () => {}, logger = con
   return createServer({ headersTimeout: 10_000, requestTimeout: 30_000 }, async (request, response) => {
     const path = request.url?.split('?', 1)[0];
     if (path === '/healthz' && request.method === 'GET') {
-      response.setHeader('X-Workspace-Features', 'default-category-v1, category-icon-v1');
+      response.setHeader('X-Workspace-Features', 'default-category-v1, category-icon-v1, sync-metadata-v1');
       send(response, 200, { ok: true });
       return;
     }
@@ -67,29 +69,42 @@ function workspaceHttpServer({ auth, service, onPending = () => {}, logger = con
       return;
     }
 
-    let operationId;
+    const started = performance.now();
+    const timing = { received_at_ms: Date.now() };
+    let status, body;
     try {
       // Parse a bounded body before spending an Admin SDK call on malformed input.
       const data = await readBody(request);
-      if (typeof data.operation_id === 'string' && /^[0-9a-f-]{36}$/.test(data.operation_id)) operationId = data.operation_id;
-      const decoded = await authenticate(request, auth);
+      timing.kind = SYNC_KINDS.has(data.kind) ? data.kind : undefined;
+      timing.operation_id = uuidForTrace(data.operation_id);
+      timing.category_hash = categoryHash(data.category_id);
+      const authStarted = performance.now();
+      let decoded;
+      try {
+        decoded = await authenticate(request, auth);
+      } finally {
+        timing.auth_ms = elapsedMs(authStarted);
+      }
       const actor = { uid: decoded.uid, token: decoded, lookupEmail: email => auth.getUserByEmail(email) };
-      const result = await service.call(actor, data);
+      const result = await service.call(actor, data, ms => { timing.firestore_ms = ms; });
+      if (Number.isSafeInteger(result?.seq)) timing.server_seq = result.seq;
       if (result?.pending === true) onPending();
-      send(response, result?.pending === true ? 202 : 200, { result });
+      status = result?.pending === true ? 202 : 200;
+      body = { result };
     } catch (error) {
       request.resume();
       if (error instanceof WorkspaceError) {
-        const status = statusByCode[error.code] ?? 500;
-        if (status >= 500) logger.warn('workspace_request_failed', {
-          business_code: error.details.business_code, operation_id: operationId
-        });
-        send(response, status, error.details);
+        status = statusByCode[error.code] ?? 500;
+        body = error.details;
       } else {
-        logger.error('workspace_request_failed', { business_code: 'INTERNAL', operation_id: operationId });
-        send(response, 500, { business_code: 'INTERNAL' });
+        status = 500;
+        body = { business_code: 'INTERNAL' };
       }
     }
+    send(response, status, body);
+    const metadata = { ...timing, status, business_code: body.business_code, elapsed_ms: elapsedMs(started) };
+    if (status >= 500) logger.warn('workspace_request_failed', metadata);
+    else logger.info?.('workspace_request', metadata);
   });
 }
 

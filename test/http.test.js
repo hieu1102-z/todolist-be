@@ -1,6 +1,6 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { randomUUID } = require('node:crypto');
+const { createHash, randomUUID } = require('node:crypto');
 const { setTimeout: delay } = require('node:timers/promises');
 const { once } = require('node:events');
 const { deleteApp } = require('firebase-admin/app');
@@ -59,13 +59,45 @@ test('production refuses Firebase emulator settings', () => {
   }), /demo project in development only/);
 });
 
+test('workspace logs correlated timings without identity, token or task content', async () => {
+  const events = [];
+  const server = workspaceHttpServer({
+    auth: { async verifyIdToken() { return { uid: 'private-user', email: 'private-email@example.test' }; } },
+    service: { async call(actor, data, observe) { observe(12); return { seq: 7 }; } },
+    logger: { info(event, fields) { events.push({ event, ...fields }); } }
+  });
+  const origin = await listen(server);
+  try {
+    const categoryId = randomUUID();
+    const operationId = randomUUID();
+    const response = await request(origin, {
+      kind: 'TRASH', category_id: categoryId, operation_id: operationId, expected_uid: 'private-user',
+      payload: { title: 'private-title' }
+    }, 'private-token');
+    assert.equal(response.status, 200);
+    assert.equal(events.length, 1);
+    const [log] = events;
+    assert.equal(log.event, 'workspace_request');
+    assert.equal(log.operation_id, operationId);
+    assert.equal(log.category_hash, createHash('sha256').update(categoryId).digest('hex').slice(0, 12));
+    assert.equal(log.server_seq, 7);
+    assert.equal(log.firestore_ms, 12);
+    assert.ok(log.auth_ms >= 0 && log.elapsed_ms >= 0 && log.received_at_ms > 0);
+    assert.doesNotMatch(JSON.stringify(log), /private|expected_uid|payload/);
+    assert.ok(!JSON.stringify(log).includes(categoryId));
+  } finally {
+    await close(server);
+  }
+});
+
 test('HTTP verifies Firebase ID tokens and rejects invalid sessions', { skip: !emulator, timeout: 30_000 }, async () => {
   const backend = createBackend({ ...process.env, FIREBASE_PROJECT_ID: projectId });
   const origin = await listen(backend.server);
   try {
     const health = await fetch(origin + '/healthz');
     assert.deepEqual(await health.json(), { ok: true });
-    assert.equal(health.headers.get('X-Workspace-Features'), 'default-category-v1, category-icon-v1');
+    assert.deepEqual(health.headers.get('X-Workspace-Features').split(', '),
+      ['default-category-v1', 'category-icon-v1', 'sync-metadata-v1']);
     const user = await signUp();
     const read = { kind: 'LIST', expected_uid: user.localId };
     assert.equal((await request(origin, read)).status, 401);
@@ -106,6 +138,22 @@ test('pending purge survives HTTP server restart and replays its durable receipt
     const accepted = await request(origin, purge, user.idToken);
     assert.deepEqual(accepted, { status: 202, body: { result: { pending: true } } });
     assert.equal((await getFirestore(backend.app).collection('cleanupJobs').get()).size, 1);
+    assert.deepEqual(await request(origin, purge, user.idToken), accepted);
+    const scope = { kind: 'SNAPSHOT', section: 'TASK', category_id: cid, expected_uid: user.localId };
+    assert.deepEqual(await request(origin, scope, user.idToken), {
+      status: 503, body: { business_code: 'CATEGORY_BUSY' }
+    });
+    const secondId = randomUUID();
+    const other = { ...command('CREATE', { base_revision: 0, payload: { name: 'Unaffected category' } }), category_id: secondId };
+    const otherCreate = await request(origin, other, user.idToken);
+    assert.equal(otherCreate.status, 200);
+    const otherSnapshot = await request(origin, { ...scope, category_id: secondId }, user.idToken);
+    assert.equal(otherSnapshot.status, 200);
+    assert.equal(otherSnapshot.body.result.seq, otherCreate.body.result.seq);
+    const listed = await request(origin, { kind: 'LIST', expected_uid: user.localId, include_sync_metadata: true }, user.idToken);
+    assert.deepEqual(listed.body.result.items.find(item => item.id === secondId), {
+      id: secondId, role: 'OWNER', server_seq: otherCreate.body.result.seq
+    });
 
     await close(server);
     server = undefined;

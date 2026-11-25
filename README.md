@@ -51,7 +51,9 @@ Lệnh deploy đưa Rules và indexes từ repo BE lên project đã chọn. Nod
 
 ## Hợp đồng HTTP
 
-- GET /healthz trả trạng thái tiến trình. Header `X-Workspace-Features` liệt kê `default-category-v1` và `category-icon-v1` khi máy chủ hỗ trợ danh mục mặc định và biểu tượng danh mục.
+- GET /healthz trả trạng thái tiến trình. Header `X-Workspace-Features` liệt kê `default-category-v1`, `category-icon-v1` và `sync-metadata-v1`.
+- Gửi `include_sync_metadata: true` trong lệnh `LIST` để lấy thêm `server_seq` của từng danh mục. APK có thể dùng mốc này để bỏ qua snapshot đã tải.
+- Trong Render Logs, đối chiếu `workspace_request` và `cleanup_receipt_committed` qua `operation_id`. Dùng `category_hash` cùng `server_seq` để đối chiếu lượt tải ở Android. `auth_ms` đo xác minh Firebase Auth và `firestore_ms` đo phần xử lý nghiệp vụ có truy cập Firestore.
 - Lệnh `ENSURE_DEFAULT_CATEGORY` tạo danh mục ẩn riêng của UID xác thực. `LIST` chỉ trả danh mục đó khi client gửi `include_default: true`. Các danh mục thường tên `to do` vẫn hoạt động như trước.
 - POST /v1/workspace nhận JSON theo cấu trúc lệnh workspace, với Firebase ID token trong Authorization: Bearer <id-token>.
 - HTTP 200 trả result cho thao tác xác nhận. HTTP 202 trả result.pending=true khi Firestore đã ghi công việc dọn và chờ hoàn thành. Gửi lại đúng operation_id và cùng nội dung để lấy kết quả.
